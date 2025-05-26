@@ -6,6 +6,7 @@ on:
 
 env:
   PLATFORM: linux/arm64
+  DOCKER_BUILDKIT: 1
 
 jobs:
   build-test-deploy:
@@ -14,29 +15,29 @@ jobs:
       run:
         shell: bash
 
-    services:
-      postgres:
-        image: postgres:14
-        env:
-          POSTGRES_DB: kubsu
-          POSTGRES_USER: kubsu
-          POSTGRES_PASSWORD: kubsu
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U kubsu"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Docker for M1/M2
+      - name: Setup Docker Buildx
         run: |
           docker buildx create --use
           docker buildx inspect --bootstrap
+
+      - name: Start PostgreSQL container
+        run: |
+          docker run -d --name postgres \
+            -e POSTGRES_DB=kubsu \
+            -e POSTGRES_USER=kubsu \
+            -e POSTGRES_PASSWORD=kubsu \
+            -p 5432:5432 \
+            postgres:14
+          until docker exec postgres pg_isready -U kubsu; do sleep 2; done
+
+      - name: Initialize DB from dump
+        run: |
+          docker cp kubsu/dump.sql postgres:/tmp/dump.sql
+          docker exec postgres psql -U kubsu -d kubsu -f /tmp/dump.sql
 
       - name: Cache Docker layers
         uses: actions/cache@v3
@@ -46,17 +47,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-docker-
 
-      - name: Wait for Postgres
-        run: |
-          until pg_isready -h localhost -p 5432 -U kubsu; do
-            echo "Waiting for Postgres..."
-            sleep 2
-          done
-
-      - name: Initialize DB from dump
-        run: psql postgresql://kubsu:kubsu@localhost:5432/kubsu -f kubsu/dump.sql
-
-      - name: Build images with cache (ARM64)
+      - name: Build and test
         run: |
           docker buildx build \
             --platform ${{ env.PLATFORM }} \
@@ -65,16 +56,15 @@ jobs:
             -t myapp:test \
             --load .
           
-          rm -rf /tmp/.buildx-cache
-          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
-
-      - name: Run tests
-        run: |
           docker run --rm \
             --platform ${{ env.PLATFORM }} \
             -e PYTHONPATH=/app \
+            --network container:postgres \
             myapp:test \
             pytest tests
+          
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
 
       - name: Build production image
         run: |
@@ -84,19 +74,10 @@ jobs:
             -t myapp:latest \
             --load .
 
-      - name: Save image
+      - name: Save and deploy
         run: |
           docker save myapp:latest > myapp.tar
-
-      - name: Set up SSH
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
-
-      - name: Deploy to remote server
-        run: |
+          
           scp -o StrictHostKeyChecking=no \
               -P ${{ secrets.SSH_PORT }} \
               myapp.tar \
@@ -115,6 +96,9 @@ jobs:
                myapp:latest \
                uvicorn src.main:app --host 0.0.0.0 --port 8089"
 
-      - name: Cleanup SSH
+      - name: Cleanup
         if: always()
-        run: rm -f ~/.ssh/id_rsa
+        run: |
+          docker stop postgres || true
+          docker rm postgres || true
+          rm -f ~/.ssh/id_rsa

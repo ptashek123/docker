@@ -19,8 +19,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Docker Buildx
+      - name: Setup Docker environment
         run: |
+          # Создаем директорию для кеша, если не существует
+          mkdir -p /tmp/.buildx-cache
           docker buildx create --use
           docker buildx inspect --bootstrap
 
@@ -39,44 +41,38 @@ jobs:
           docker cp kubsu/dump.sql postgres:/tmp/dump.sql
           docker exec postgres psql -U kubsu -d kubsu -f /tmp/dump.sql
 
-      - name: Cache Docker layers
-        uses: actions/cache@v3
-        with:
-          path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-docker-${{ hashFiles('**/Dockerfile') }}
-          restore-keys: |
-            ${{ runner.os }}-docker-
-
-      - name: Build and test
+      - name: Build test image with pytest
         run: |
           docker buildx build \
             --platform ${{ env.PLATFORM }} \
-            --cache-from type=local,src=/tmp/.buildx-cache \
-            --cache-to type=local,dest=/tmp/.buildx-cache-new \
+            --target builder \
             -t myapp:test \
             --load .
-          
+
+      - name: Run tests
+        run: |
           docker run --rm \
             --platform ${{ env.PLATFORM }} \
             -e PYTHONPATH=/app \
             --network container:postgres \
             myapp:test \
-            pytest tests
-          
-          rm -rf /tmp/.buildx-cache
-          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+            python -m pytest tests/
 
       - name: Build production image
         run: |
           docker buildx build \
             --platform ${{ env.PLATFORM }} \
-            --cache-from type=local,src=/tmp/.buildx-cache \
             -t myapp:latest \
             --load .
 
       - name: Save and deploy
         run: |
           docker save myapp:latest > myapp.tar
+          
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
           
           scp -o StrictHostKeyChecking=no \
               -P ${{ secrets.SSH_PORT }} \
@@ -101,4 +97,4 @@ jobs:
         run: |
           docker stop postgres || true
           docker rm postgres || true
-          rm -f ~/.ssh/id_rsa
+          rm -f ~/.ssh/id_rsa myapp.tar

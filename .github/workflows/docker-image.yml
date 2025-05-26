@@ -64,15 +64,31 @@ jobs:
             --platform ${{ env.PLATFORM }} \
             -t myapp:latest \
             --load .
-
-      - name: Save and deploy
-        run: |
-          docker save myapp:latest > myapp.tar
           
-          mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+          # Явная проверка что образ создан
+          docker image inspect myapp:latest
+
+      - name: Save and validate image
+        run: |
+          # Сохраняем с явным указанием выходного файла
+          docker save myapp:latest -o myapp.tar
+          
+          # Проверяем что архив не пустой
+          if [ ! -s myapp.tar ]; then
+            echo "Error: myapp.tar is empty or not created!"
+            exit 1
+          fi
+          
+          echo "Image saved successfully:"
+          ls -lh myapp.tar
+
+      - name: Deploy to remote server
+        run: |
+          # Проверяем существование файла перед передачей
+          if [ ! -f myapp.tar ]; then
+            echo "Error: myapp.tar not found!"
+            exit 1
+          fi
           
           scp -o StrictHostKeyChecking=no \
               -P ${{ secrets.SSH_PORT }} \
@@ -95,6 +111,7 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
+          rm -f myapp.tar
           docker stop postgres || true
           docker rm postgres || true
           rm -f ~/.ssh/id_rsa myapp.tar

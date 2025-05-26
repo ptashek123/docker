@@ -7,6 +7,8 @@ COPY pyproject.toml ./
 
 RUN pip install .[test]
 
+RUN pip install pytest
+
 COPY . .
 
 # Stage 2: Production image

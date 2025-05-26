@@ -26,6 +26,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
       - name: Wait for Postgres
         run: |
           until pg_isready -h localhost -p 5432 -U kubsu; do
@@ -36,23 +39,29 @@ jobs:
       - name: Initialize DB from dump
         run: psql postgresql://kubsu:kubsu@localhost:5432/kubsu -f kubsu/dump.sql
 
-      - name: Build Docker image
-        run: docker build -t myapp:test .
-
       - name: Build test image
-        run: docker build --target builder -t myapp:test .
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --target builder \
+            -t myapp:test \
+            --load .
 
       - name: Run tests
         run: |
           docker run --rm \
-            --network host \
+            --platform linux/amd64 \
+            -p 8089:8089 \
             -e PYTHONPATH=/app \
             myapp:test \
             pytest tests
 
-
-      - name: Build prod image
-        run: docker build -t myapp:latest .
+      - name: Build production image
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            -t myapp:latest \
+            --load .
 
       - name: Set up SSH
         uses: webfactory/ssh-agent@v0.5.4
@@ -71,6 +80,7 @@ jobs:
              (podman rm myapp || true) && \
              podman run -d \
                --name myapp \
-               --network host \
+               -p 8089:8089 \
+               -p 8090:8090 \
                myapp:latest \
                uvicorn src.main:app --host 0.0.0.0 --port 8089"

@@ -47,7 +47,6 @@ jobs:
             --target builder \
             -t myapp:test \
             --load .
-          
           python -m pytest tests
 
       - name: Build production image
@@ -56,7 +55,6 @@ jobs:
             --platform linux/amd64 \
             -t myapp:latest \
             --load .
-          
           docker save myapp:latest > myapp.tar
 
       - name: Upload artifact
@@ -66,10 +64,12 @@ jobs:
           path: myapp.tar
           retention-days: 1
 
-      - name: Set up SSH
-        uses: webfactory/ssh-agent@v1
-        with:
-          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+      - name: Install SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
 
       - name: Deploy to remote server
         run: |
@@ -91,3 +91,7 @@ jobs:
                -p 8090:8090 \
                myapp:latest \
                uvicorn src.main:app --host 0.0.0.0 --port 8089"
+
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/id_rsa

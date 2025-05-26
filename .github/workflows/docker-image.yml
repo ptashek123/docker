@@ -4,9 +4,18 @@ on:
   push:
     branches: [main]
 
+env:
+  DOCKER_BUILDKIT: 1
+  PLATFORM: linux/arm64
+  DOCKER_DEFAULT_PLATFORM: linux/arm64
+
 jobs:
   build-test-deploy:
     runs-on: self-hosted
+    defaults:
+      run:
+        shell: bash
+
     services:
       postgres:
         image: postgres:14
@@ -24,7 +33,20 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+
+      - name: Setup Docker for M1/M2
+        run: |
+          docker buildx create --use
+          docker buildx inspect --bootstrap
+
+      - name: Cache Docker layers
+        uses: actions/cache@v3
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-docker-${{ hashFiles('**/Dockerfile') }}
+          restore-keys: |
+            ${{ runner.os }}-docker-
 
       - name: Wait for Postgres
         run: |
@@ -36,36 +58,56 @@ jobs:
       - name: Initialize DB from dump
         run: psql postgresql://kubsu:kubsu@localhost:5432/kubsu -f kubsu/dump.sql
 
-      - name: Build Docker image
-        run: docker build -t myapp:test .
-
-      - name: Build test image
-        run: docker build --target builder -t myapp:test .
+      - name: Build images with cache (ARM64)
+        run: |
+          docker buildx build \
+            --platform ${{ env.PLATFORM }} \
+            --cache-from type=local,src=/tmp/.buildx-cache \
+            --cache-to type=local,dest=/tmp/.buildx-cache-new \
+            -t myapp:test \
+            --load .
+          
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
 
       - name: Run tests
         run: |
           docker run --rm \
-            --network host \
+            --platform ${{ env.PLATFORM }} \
             -e PYTHONPATH=/app \
             myapp:test \
             pytest tests
 
+      - name: Build production image
+        run: |
+          docker buildx build \
+            --platform ${{ env.PLATFORM }} \
+            --cache-from type=local,src=/tmp/.buildx-cache \
+            -t myapp:latest \
+            --load .
 
-      - name: Build prod image
-        run: docker build -t myapp:latest .
+      - name: Save image
+        run: |
+          docker save myapp:latest > myapp.tar
 
       - name: Set up SSH
-        uses: webfactory/ssh-agent@v0.5.4
-        with:
-          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
 
       - name: Deploy to remote server
         run: |
-          docker save myapp:latest | \
-            ssh -o StrictHostKeyChecking=no \
-                -p ${{ secrets.SSH_PORT }} \
-                ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
-            "podman load && \
+          scp -o StrictHostKeyChecking=no \
+              -P ${{ secrets.SSH_PORT }} \
+              myapp.tar \
+              ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/myapp.tar
+          
+          ssh -o StrictHostKeyChecking=no \
+              -p ${{ secrets.SSH_PORT }} \
+              ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "podman load -i /tmp/myapp.tar && \
              podman tag myapp:latest myapp:latest && \
              (podman stop myapp || true) && \
              (podman rm myapp || true) && \
@@ -74,3 +116,7 @@ jobs:
                --network host \
                myapp:latest \
                uvicorn src.main:app --host 0.0.0.0 --port 8089"
+
+      - name: Cleanup SSH
+        if: always()
+        run: rm -f ~/.ssh/id_rsa

@@ -7,7 +7,6 @@ on:
 jobs:
   build-test-deploy:
     runs-on: self-hosted
-    
     services:
       postgres:
         image: postgres:14
@@ -25,10 +24,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: actions/checkout@v3
 
       - name: Wait for Postgres
         run: |
@@ -40,58 +36,41 @@ jobs:
       - name: Initialize DB from dump
         run: psql postgresql://kubsu:kubsu@localhost:5432/kubsu -f kubsu/dump.sql
 
-      - name: Build and test
-        run: |
-          docker buildx build \
-            --platform linux/amd64 \
-            --target builder \
-            -t myapp:test \
-            --load .
-          python -m pytest tests
+      - name: Build Docker image
+        run: docker build -t myapp:test .
 
-      - name: Build production image
-        run: |
-          docker buildx build \
-            --platform linux/amd64 \
-            -t myapp:latest \
-            --load .
-          docker save myapp:latest > myapp.tar
+      - name: Build test image
+        run: docker build --target builder -t myapp:test .
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Run tests
+        run: |
+          docker run --rm \
+            --network host \
+            -e PYTHONPATH=/app \
+            myapp:test \
+            pytest tests
+
+
+      - name: Build prod image
+        run: docker build -t myapp:latest .
+
+      - name: Set up SSH
+        uses: webfactory/ssh-agent@v0.5.4
         with:
-          name: docker-image
-          path: myapp.tar
-          retention-days: 1
-
-      - name: Install SSH key
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
 
       - name: Deploy to remote server
         run: |
-          scp -o StrictHostKeyChecking=no \
-              -P ${{ secrets.SSH_PORT }} \
-              myapp.tar \
-              ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/myapp.tar
-          
-          ssh -o StrictHostKeyChecking=no \
-              -p ${{ secrets.SSH_PORT }} \
-              ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
-            "podman load -i /tmp/myapp.tar && \
+          docker save myapp:latest | \
+            ssh -o StrictHostKeyChecking=no \
+                -p ${{ secrets.SSH_PORT }} \
+                ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "podman load && \
              podman tag myapp:latest myapp:latest && \
              (podman stop myapp || true) && \
              (podman rm myapp || true) && \
              podman run -d \
                --name myapp \
-               -p 8089:8089 \
-               -p 8090:8090 \
+               --network host \
                myapp:latest \
                uvicorn src.main:app --host 0.0.0.0 --port 8089"
-
-      - name: Cleanup SSH key
-        if: always()
-        run: rm -f ~/.ssh/id_rsa

@@ -70,10 +70,8 @@ jobs:
 
       - name: Save and validate image
         run: |
-          # Сохраняем с явным указанием выходного файла
           docker save myapp:latest -o myapp.tar
           
-          # Проверяем что архив не пустой
           if [ ! -s myapp.tar ]; then
             echo "Error: myapp.tar is empty or not created!"
             exit 1
@@ -84,12 +82,6 @@ jobs:
 
       - name: Deploy to remote server
         run: |
-          # Проверяем существование файла перед передачей
-          if [ ! -f myapp.tar ]; then
-            echo "Error: myapp.tar not found!"
-            exit 1
-          fi
-          
           scp -o StrictHostKeyChecking=no \
               -P ${{ secrets.SSH_PORT }} \
               myapp.tar \

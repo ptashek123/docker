@@ -103,7 +103,7 @@ jobs:
              (podman stop myapp || true) && \
              (podman rm myapp || true) && \
              podman run -d \
-               --name localhost/myapp \
+               --name myapp \
                --network host \
                myapp:latest \
                uvicorn src.main:app --host 0.0.0.0 --port 8089"

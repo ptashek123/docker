@@ -5,7 +5,7 @@ on:
     branches: [main]
 
 env:
-  PLATFORM: linux/arm64
+  PLATFORM: linux/amd64
   DOCKER_BUILDKIT: 1
 
 jobs:

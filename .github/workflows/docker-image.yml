@@ -1,32 +1,27 @@
-name: MYdocker
+name: CI/CD Pipeline
 
 on:
   push:
     branches: [main]
 
 env:
-  PLATFORM: linux/arm64
+  PLATFORM: linux/amd64
   DOCKER_BUILDKIT: 1
 
 jobs:
-  build-test-deploy:
+  setup_environment:
+    name: "1. Environment Setup"
     runs-on: self-hosted
-    defaults:
-      run:
-        shell: bash
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Docker environment
+      - name: Prepare Docker
         run: |
-          # Создаем директорию для кеша, если не существует
-          mkdir -p /tmp/.buildx-cache
           docker buildx create --use
           docker buildx inspect --bootstrap
 
-      - name: Start PostgreSQL container
+      - name: Start PostgreSQL
         run: |
           docker run -d --name postgres \
             -e POSTGRES_DB=kubsu \
@@ -36,21 +31,25 @@ jobs:
             postgres:14
           until docker exec postgres pg_isready -U kubsu; do sleep 2; done
 
-      - name: Initialize DB from dump
-        run: |
-          docker cp kubsu/dump.sql postgres:/tmp/dump.sql
-          docker exec postgres psql -U kubsu -d kubsu -f /tmp/dump.sql
+  build_and_test:
+    name: "2. Build & Test"
+    needs: setup_environment
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - name: Build test image with pytest
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Build and test
         run: |
           docker buildx build \
             --platform ${{ env.PLATFORM }} \
             --target builder \
             -t myapp:test \
             --load .
-
-      - name: Run tests
-        run: |
+          
           docker run --rm \
             --platform ${{ env.PLATFORM }} \
             -e PYTHONPATH=/app \
@@ -65,34 +64,34 @@ jobs:
             -t myapp:latest \
             --load .
           
-          # Явная проверка что образ создан
-          docker image inspect myapp:latest
-
-      - name: Save and validate image
-        run: |
           docker save myapp:latest -o myapp.tar
-          
-          if [ ! -s myapp.tar ]; then
-            echo "Error: myapp.tar is empty or not created!"
-            exit 1
-          fi
-          
-          echo "Image saved successfully:"
           ls -lh myapp.tar
 
-      - name: Deploy to remote server
+      - uses: actions/upload-artifact@v3
+        with:
+          name: docker-image
+          path: myapp.tar
+
+  deploy:
+    name: "3. Deployment"
+    needs: build_and_test
+    runs-on: self-hosted
+    steps:
+      - uses: actions/download-artifact@v3
+        with:
+          name: docker-image
+
+      - name: Deploy to server
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
           
-          ssh-keyscan -p ${{ secrets.SSH_PORT }} ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
-          
           scp -o StrictHostKeyChecking=no \
               -i ~/.ssh/id_rsa \
               -P ${{ secrets.SSH_PORT }} \
               myapp.tar \
-              ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/myapp.tar
+              ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/
           
           ssh -o StrictHostKeyChecking=no \
               -i ~/.ssh/id_rsa \
@@ -108,9 +107,14 @@ jobs:
                myapp:latest \
                uvicorn src.main:app --host 0.0.0.0 --port 8089"
 
-      - name: Cleanup
-        if: always()
+  cleanup:
+    name: "4. Cleanup"
+    needs: deploy
+    if: always()
+    runs-on: self-hosted
+    steps:
+      - name: Remove resources
         run: |
-          rm -f myapp.tar
           docker stop postgres || true
           docker rm postgres || true
+          rm -f ~/.ssh/id_rsa myapp.tar

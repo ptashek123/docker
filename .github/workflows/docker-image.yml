@@ -24,9 +24,10 @@ jobs:
           - 5432:5432
         options: >-
           --health-cmd pg_isready -U kubsu
-          --health-interval 10s
-          --health-timeout 5s
+          --health-interval 30s
+          --health-timeout 10s
           --health-retries 5
+          --network-alias postgres
 
     steps:
       - name: Checkout code
@@ -34,17 +35,24 @@ jobs:
 
       - name: Wait for PostgreSQL
         run: |
-          while ! nc -z localhost 5432; do
-            sleep 1
+          echo "Waiting for PostgreSQL to start..."
+          for i in {1..30}; do
+            if docker ps | grep postgres; then
+              if docker exec postgres pg_isready -U kubsu; then
+                echo "PostgreSQL is ready!"
+                break
+              fi
+            fi
+            sleep 2
           done
-          sleep 5
 
       - name: Initialize DB
         run: |
-          psql postgresql://kubsu:kubsu@localhost:5432/kubsu -f kubsu/dump.sql
+          docker cp kubsu/dump.sql postgres:/tmp/dump.sql
+          docker exec postgres psql -U kubsu -d kubsu -f /tmp/dump.sql
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Build and test
         run: |
@@ -115,6 +123,3 @@ jobs:
                --network host \
                myapp:latest \
                uvicorn src.main:app --host 0.0.0.0 --port 8089"
-
-      - name: Preserve SSH key
-        run: echo "SSH key preserved at ~/.ssh/id_rsa"

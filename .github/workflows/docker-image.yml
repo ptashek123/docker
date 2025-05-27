@@ -1,34 +1,27 @@
-name: CI/CD Pipeline
+name: MYdocker
 
 on:
   push:
     branches: [main]
 
 env:
-  PLATFORM: linux/amd64
+  PLATFORM: linux/arm64
   DOCKER_BUILDKIT: 1
 
 jobs:
   setup_environment:
     name: "1. Environment Setup"
     runs-on: self-hosted
-    defaults:
-      run:
-        shell: bash
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Docker environment
-      - name: Prepare Docker
+      - name: Initialize Docker
         run: |
-          # Создаем директорию для кеша, если не существует
           mkdir -p /tmp/.buildx-cache
           docker buildx create --use
           docker buildx inspect --bootstrap
 
-      - name: Start PostgreSQL container
       - name: Start PostgreSQL
         run: |
           docker run -d --name postgres \
@@ -39,19 +32,44 @@ jobs:
             postgres:14
           until docker exec postgres pg_isready -U kubsu; do sleep 2; done
 
-      - name: Initialize DB from dump
+      - name: Load Database
         run: |
           docker cp kubsu/dump.sql postgres:/tmp/dump.sql
           docker exec postgres psql -U kubsu -d kubsu -f /tmp/dump.sql
-  build_and_test:
+
+      - name: Preserve PostgreSQL
+        run: echo "PostgreSQL container kept running"
+
+  build:
     name: "2. Build & Test"
     needs: setup_environment
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_DB: kubsu
+          POSTGRES_USER: kubsu
+          POSTGRES_PASSWORD: kubsu
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready -U kubsu
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Build test image with pytest
+      - name: Wait for PostgreSQL
+        run: |
+          while ! nc -z localhost 5432; do
+            sleep 1
+          done
+          sleep 5
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -62,14 +80,12 @@ jobs:
             --target builder \
             -t myapp:test \
             --load .
-
-      - name: Run tests
-        run: |
           
           docker run --rm \
             --platform ${{ env.PLATFORM }} \
             -e PYTHONPATH=/app \
-            --network container:postgres \
+            --network host \
+            -e DB_HOST=localhost \
             myapp:test \
             python -m pytest tests/
 
@@ -80,49 +96,38 @@ jobs:
             -t myapp:latest \
             --load .
           
-          docker image inspect myapp:latest
-
-      - name: Save and validate image
-        run: |
           docker save myapp:latest -o myapp.tar
-          
-          if [ ! -s myapp.tar ]; then
-            echo "Error: myapp.tar is empty or not created!"
-            exit 1
-          fi
-          
-          echo "Image saved successfully:"
           ls -lh myapp.tar
 
-      - name: Deploy to remote server
       - uses: actions/upload-artifact@v4
         with:
           name: docker-image
           path: myapp.tar
+          retention-days: 1
 
   deploy:
     name: "3. Deployment"
-    needs: build_and_test
+    needs: build
     runs-on: self-hosted
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: docker-image
 
-      - name: Deploy to server
+      - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-          
           ssh-keyscan -p ${{ secrets.SSH_PORT }} ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
-          
+
+      - name: Deploy to server
+        run: |
           scp -o StrictHostKeyChecking=no \
               -i ~/.ssh/id_rsa \
               -P ${{ secrets.SSH_PORT }} \
               myapp.tar \
               ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/myapp.tar
-              ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/
           
           ssh -o StrictHostKeyChecking=no \
               -i ~/.ssh/id_rsa \

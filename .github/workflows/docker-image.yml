@@ -24,6 +24,7 @@ jobs:
 
       - name: Start PostgreSQL
         run: |
+          docker rm -f postgres || true  # Удаляет контейнер, если он есть
           docker run -d --name postgres \
             -e POSTGRES_DB=kubsu \
             -e POSTGRES_USER=kubsu \

@@ -9,35 +9,39 @@ env:
   DOCKER_BUILDKIT: 1
 
 jobs:
-  setup_environment:
-    name: "1. Environment Setup"
-    runs-on: self-hosted
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Prepare Docker
-        run: |
-          docker buildx create --use
-          docker buildx inspect --bootstrap
-
-      - name: Start PostgreSQL
-        run: |
-          docker run -d --name postgres \
-            -e POSTGRES_DB=kubsu \
-            -e POSTGRES_USER=kubsu \
-            -e POSTGRES_PASSWORD=kubsu \
-            -p 5432:5432 \
-            postgres:14
-          until docker exec postgres pg_isready -U kubsu; do sleep 2; done
-
   build_and_test:
-    name: "2. Build & Test"
-    needs: setup_environment
+    name: "Build & Test"
     runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_DB: kubsu
+          POSTGRES_USER: kubsu
+          POSTGRES_PASSWORD: kubsu
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready -U kubsu
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Wait for PostgreSQL
+        run: |
+          while ! nc -z localhost 5432; do
+            sleep 1
+          done
+          sleep 5
+
+      - name: Initialize DB
+        run: |
+          psql postgresql://kubsu:kubsu@localhost:5432/kubsu -f kubsu/dump.sql
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -53,7 +57,8 @@ jobs:
           docker run --rm \
             --platform ${{ env.PLATFORM }} \
             -e PYTHONPATH=/app \
-            --network container:postgres \
+            --network host \
+            -e DB_HOST=localhost \
             myapp:test \
             python -m pytest tests/
 
@@ -71,9 +76,10 @@ jobs:
         with:
           name: docker-image
           path: myapp.tar
+          retention-days: 1
 
   deploy:
-    name: "3. Deployment"
+    name: "Deployment"
     needs: build_and_test
     runs-on: self-hosted
     steps:
@@ -81,12 +87,15 @@ jobs:
         with:
           name: docker-image
 
-      - name: Deploy to server
+      - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-          
+          ssh-keyscan -p ${{ secrets.SSH_PORT }} ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Deploy to server
+        run: |
           scp -o StrictHostKeyChecking=no \
               -i ~/.ssh/id_rsa \
               -P ${{ secrets.SSH_PORT }} \
@@ -107,4 +116,5 @@ jobs:
                myapp:latest \
                uvicorn src.main:app --host 0.0.0.0 --port 8089"
 
-          echo "SSH key preserved at ~/.ssh/id_rsa"
+      - name: Preserve SSH key
+        run: echo "SSH key preserved at ~/.ssh/id_rsa"

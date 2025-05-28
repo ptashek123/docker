@@ -1,51 +1,13 @@
-name: MYdocker
+name: docker-image & CI
 
 on:
   push:
-    branches: [main]
-
-env:
-  PLATFORM: linux/amd64
-  DOCKER_BUILDKIT: 1
+    branches: [master]
 
 jobs:
-  setup_environment:
-    name: "1. Environment Setup"
+  build-test-deploy:
     runs-on: self-hosted
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
 
-      - name: Initialize Docker
-        run: |
-          mkdir -p /tmp/.buildx-cache
-          docker buildx create --use
-          docker buildx inspect --bootstrap
-
-      - name: Start PostgreSQL
-        run: |
-          docker rm -f postgres || true  # Удаляет контейнер, если он есть
-          docker run -d --name postgres \
-            -e POSTGRES_DB=kubsu \
-            -e POSTGRES_USER=kubsu \
-            -e POSTGRES_PASSWORD=kubsu \
-            -p 5432:5432 \
-            --health-cmd="pg_isready -U kubsu" \
-            --health-interval=10s \
-            --health-timeout=5s \
-            --health-retries=5 \
-            postgres:14
-          until docker exec postgres pg_isready -U kubsu; do sleep 2; done
-
-      - name: Load Database
-        run: |
-          docker cp kubsu/dump.sql postgres:/tmp/dump.sql
-          docker exec postgres psql -U kubsu -d kubsu -f /tmp/dump.sql
-
-  build:
-    name: "2. Build & Test"
-    needs: setup_environment
-    runs-on: self-hosted
     services:
       postgres:
         image: postgres:14
@@ -53,8 +15,6 @@ jobs:
           POSTGRES_DB: kubsu
           POSTGRES_USER: kubsu
           POSTGRES_PASSWORD: kubsu
-        ports:
-          - 5432:5432
         options: >-
           --health-cmd "pg_isready -U kubsu"
           --health-interval 10s
@@ -63,88 +23,58 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
-      - name: Wait for PostgreSQL
+      - name: Initialize DB from dump
         run: |
-          echo "Waiting for PostgreSQL to start..."
-          for i in {1..30}; do
-            if nc -z localhost 5432; then
-              echo "PostgreSQL is ready!"
-              break
-            fi
-            sleep 2
-          done
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Build and test
-        run: |
-          docker buildx build \
-            --platform ${{ env.PLATFORM }} \
-            --target builder \
-            -t myapp:test \
-            --load .
-          
           docker run --rm \
-            --platform ${{ env.PLATFORM }} \
+            --network container:${{ job.services.postgres.id }} \
+            -v ${{ github.workspace }}/kubsu:/tmp \
+            postgres:14 \
+            psql postgresql://kubsu:kubsu@postgres:5432/kubsu -f /tmp/dump.sql
+
+      - name: Build Docker image
+        run: docker build --no-cache -t myapp:test .
+
+      - name: Build test image
+        run: docker build --target test -t myapp:test .
+      
+      - name: Inspect installed packages
+        run: docker run --rm myapp:test pip freeze
+
+      - name: Run tests
+        run: |
+          docker run --rm \
+            --network container:${{ job.services.postgres.id }} \
             -e PYTHONPATH=/app \
-            --network host \
-            -e DB_HOST=localhost \
-            myapp:test \
-            python -m pytest tests/
+            -e DATABASE_URL=postgresql+psycopg://kubsu:kubsu@postgres:5432/kubsu \
+            myapp:test
 
-      - name: Build production image
-        run: |
-          docker buildx build \
-            --platform ${{ env.PLATFORM }} \
-            -t myapp:latest \
-            --load .
-          
-          docker save myapp:latest -o myapp.tar
-          ls -lh myapp.tar
+      - name: Build prod image
+        run: docker build -t myapp:latest .
 
-      - uses: actions/upload-artifact@v4
+      - name: Set up SSH
+        uses: webfactory/ssh-agent@v0.5.4
         with:
-          name: docker-image
-          path: myapp.tar
-          retention-days: 1
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
 
-  deploy:
-    name: "3. Deployment"
-    needs: build
-    runs-on: self-hosted
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: docker-image
+      - name: Save Docker image to archive
+        run: docker save myapp:latest -o myapp.tar
 
-      - name: Setup SSH
+      - name: Deploy to remote server
         run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -p ${{ secrets.SSH_PORT }} ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+          scp -P ${{ secrets.SSH_PORT }} myapp.tar ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:~/myapp.tar
 
-      - name: Deploy to server
-        run: |
-          scp -o StrictHostKeyChecking=no \
-              -i ~/.ssh/id_rsa \
-              -P ${{ secrets.SSH_PORT }} \
-              myapp.tar \
-              ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/myapp.tar
-          
-          ssh -o StrictHostKeyChecking=no \
-              -i ~/.ssh/id_rsa \
-              -p ${{ secrets.SSH_PORT }} \
-              ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
-            "podman load -i /tmp/myapp.tar && \
-             podman tag myapp:latest myapp:latest && \
-             (podman stop myapp || true) && \
-             (podman rm myapp || true) && \
-             podman run -d \
-               --name myapp \
-               --network host \
-               myapp:latest \
-               uvicorn src.main:app --host 0.0.0.0 --port 8089"
+          ssh -o StrictHostKeyChecking=no -p ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} '
+            set -e
+            podman load < ~/myapp.tar
+            podman stop myapp || true
+            podman rm myapp || true
+            podman run -d \
+              --name myapp \
+              --network host \
+              -e DATABASE_URL=postgresql+psycopg://kubsu:kubsu@localhost:5432/kubsu \
+              --restart=always \
+              myapp:latest \
+              uvicorn src.main:app --host 127.0.0.1 --port 8089
+          '

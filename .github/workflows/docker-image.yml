@@ -1,4 +1,4 @@
-name: ocker-images
+name: oker-images
 
 on:
   push:
